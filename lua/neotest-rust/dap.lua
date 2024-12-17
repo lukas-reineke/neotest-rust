@@ -6,6 +6,9 @@ local M = {}
 
 local has_quantified_captures = vim.fn.has("nvim-0.11.0") == 1
 
+local src_path_cache = {}
+local cargo_compiled_changedtick = -1
+
 --
 --{
 --  "target": {
@@ -17,6 +20,10 @@ local has_quantified_captures = vim.fn.has("nvim-0.11.0") == 1
 -- Return a table containing each 'src_path' => 'executable' listed by
 -- 'cargo test --message-format=JSON' (see sample output above).
 local function get_src_paths(root)
+    if cargo_compiled_changedtick == vim.g.rust_changedtick and src_path_cache[root] ~= nil then
+        return src_path_cache[root]
+    end
+
     local src_paths = {}
     local src_filter = '"src_path":"(.+' .. sep .. '.+.rs)",'
     local exe_filter = '"executable":"(.+' .. sep .. "deps" .. sep .. '.+)",'
@@ -27,23 +34,75 @@ local function get_src_paths(root)
         "--manifest-path=" .. root .. sep .. "Cargo.toml",
         "--message-format=JSON",
         "--no-run",
-        "--quiet",
+        -- "--quiet",
     }
-    local handle = assert(io.popen(table.concat(cmd, " ")))
-    local line = handle:read("l")
 
-    while line do
+    local compiler_msg_buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_set_option_value("buftype", "nofile", { buf = compiler_msg_buf })
+    local window_width = 100
+    local window_height = 12
+    local compiler_msg_window = vim.api.nvim_open_win(compiler_msg_buf, false, {
+        relative = "editor",
+        width = window_width,
+        height = window_height,
+        col = vim.api.nvim_get_option_value("columns", {}) - window_width - 1,
+        row = vim.api.nvim_get_option_value("lines", {}) - window_height - 1,
+        border = vim.g.floating_window_border_dark,
+        style = "minimal",
+        title = "Cargo test",
+    })
+
+    local compiler_metadata = {}
+    local cargo_job = vim.fn.jobstart(cmd, {
+        clear_env = false,
+
+        stdout_buffered = true,
+        on_stdout = function(_, data)
+            compiler_metadata = data
+        end,
+
+        on_stderr = function(_, data)
+            local complete_line = ""
+
+            for _, partial_line in ipairs(data) do
+                if string.len(partial_line) ~= 0 then
+                    complete_line = complete_line .. partial_line
+                end
+            end
+
+            if vim.api.nvim_buf_is_valid(compiler_msg_buf) then
+                vim.fn.appendbufline(compiler_msg_buf, "$", complete_line)
+                vim.api.nvim_win_set_cursor(compiler_msg_window, { vim.api.nvim_buf_line_count(compiler_msg_buf), 1 })
+                vim.cmd("redraw")
+            end
+        end,
+
+        on_exit = function(_, exit_code)
+            if exit_code ~= 0 then
+                vim.notify("Cargo failed to compile test", vim.log.levels.ERROR)
+            end
+            if vim.api.nvim_win_is_valid(compiler_msg_window) then
+                vim.api.nvim_win_close(compiler_msg_window, true)
+            end
+
+            if vim.api.nvim_buf_is_valid(compiler_msg_buf) then
+                vim.api.nvim_buf_delete(compiler_msg_buf, { force = true })
+            end
+        end,
+    })
+
+    vim.fn.jobwait({ cargo_job })
+
+    for _, line in ipairs(compiler_metadata) do
         if string.find(line, src_filter) and string.find(line, exe_filter) then
             local src_path = string.match(line, src_filter)
             local executable = string.match(line, exe_filter)
             src_paths[src_path] = executable
         end
-        line = handle:read("l")
     end
 
-    if handle then
-        handle:close()
-    end
+    src_path_cache[root] = src_paths
+    cargo_compiled_changedtick = vim.g.rust_changedtick
 
     return src_paths
 end
